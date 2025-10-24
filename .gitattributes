@@ -1,0 +1,8 @@
+data/raw/*.txt filter=lfs diff=lfs merge=lfs -text
+data/processed/*.dat filter=lfs diff=lfs merge=lfs -text
+data/processed/*.txt filter=lfs diff=lfs merge=lfs -text
+data/embeddings/*.pth filter=lfs diff=lfs merge=lfs -text
+data/embeddings/*.npy filter=lfs diff=lfs merge=lfs -text
+data/embeddings/*.csv filter=lfs diff=lfs merge=lfs -text
+data/embeddings/*.pkl filter=lfs diff=lfs merge=lfs -text
+data/misc/*.csv filter=lfs diff=lfs merge=lfs -text
