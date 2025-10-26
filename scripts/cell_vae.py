@@ -68,7 +68,7 @@ if __name__ == '__main__':
     EXPRESSION_FILE = 'data/embeddings/OmicsExpressionProteinCodingGenesTPMLogp1.csv'
     OUTPUT_EMBEDDING_FILE = 'data/embeddings/final_vae_cell_embeddings.npy'
     OUTPUT_MODEL_FILE = 'data/embeddings/cell_vae_weights.pth'
-
+    OUTPUT_CELL_LIST_FILE = 'data/embeddings/final_vae_cell_names.txt'
     # Check if input file exists
     if not os.path.exists(EXPRESSION_FILE):
         print(f"FATAL ERROR: Expression file not found at {EXPRESSION_FILE}")
@@ -188,9 +188,18 @@ if __name__ == '__main__':
              
     final_embeddings_mu = torch.cat(final_embeddings_mu, dim=0).numpy()
 
-    np.save(OUTPUT_EMBEDDING_FILE, final_embeddings_mu)
-    print(f"Saved final embeddings ({final_embeddings_mu.shape}) to: {OUTPUT_EMBEDDING_FILE}")
+    np.save(OUTPUT_EMBEDDING_FILE, mu.cpu().numpy())
+    print(f"Saved embeddings to: {OUTPUT_EMBEDDING_FILE}")
 
-    # Note: Saving the model weights already happened during training when best val loss was found.
-    # We keep the torch.save() call within the loop for clarity on saving the *best* model.
-    print(f"Best model weights were saved to: {OUTPUT_MODEL_FILE}")
+    # --- vvv ADD THIS BLOCK vvv ---
+    # Save the cell names (DepMap IDs) in the same order as the embeddings
+    cell_names_in_order = df_expr.index.tolist()
+    with open(OUTPUT_CELL_LIST_FILE, 'w') as f:
+        for name in cell_names_in_order:
+            f.write(f"{name}\n")
+    print(f"Saved cell names/IDs to: {OUTPUT_CELL_LIST_FILE}")
+    # --- ^^^ END BLOCK ^^^ ---
+
+    # Save model weights
+    torch.save(model.state_dict(), OUTPUT_MODEL_FILE)
+    print(f"Saved model weights to: {OUTPUT_MODEL_FILE}")

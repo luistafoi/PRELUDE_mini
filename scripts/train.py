@@ -7,7 +7,7 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import random
-from tqdm import tqdm
+from tqdm import tqdm 
 import csv
 from torch.utils.tensorboard import SummaryWriter
 import argparse # Added for Namespace
@@ -158,8 +158,21 @@ def main():
          sys.exit(1)
 
 
-    # --- Prepare Fixed Validation Loader ---
-    print("\nPreparing validation dataloader...")
+    # --- Prepare DataLoaders ONCE ---
+    print("\nPreparing dataloaders...")
+    
+    # --- Training Loader (Created Once) ---
+    all_train_pos = dataset.links.get('train_lp', [])
+    if not all_train_pos:
+         print("FATAL ERROR: No training LP links found ('train_lp_links.dat'). Cannot train.")
+         sys.exit(1)
+    
+    # The 80% sampling and negative sampling happens ONCE here
+    train_dataset = LinkPredictionDataset(all_train_pos, dataset, sample_ratio=0.8, neg_sample_ratio=1)
+    train_loader = DataLoader(train_dataset, batch_size=args.mini_batch_s, shuffle=True, num_workers=8) # Added shuffle & num_workers
+    print(f"  > Created training loader with {len(train_dataset)} links.")
+
+    # --- Fixed Validation Loader (Created Once) ---
     valid_pos = dataset.links.get('valid_inductive', [])
     if not valid_pos:
         print("Warning: No inductive validation links found. Validation will be skipped.")
@@ -167,15 +180,14 @@ def main():
     else:
         # Use LinkPredictionDataset with sample_ratio=1.0 for validation
         valid_dataset = LinkPredictionDataset(valid_pos, dataset, sample_ratio=1.0, neg_sample_ratio=1)
-        valid_loader = DataLoader(valid_dataset, batch_size=args.mini_batch_s)
-        print(f"  > Created validation loader with {len(valid_dataset)} links ({len(valid_pos)} positive).")
+        valid_loader = DataLoader(valid_dataset, batch_size=args.mini_batch_s, num_workers=8) # Added num_workers
+        print(f"  > Created validation loader with {len(valid_dataset)} links.")
 
     # --- Training Loop & Logging Setup ---
     best_valid_auc = 0.0
     patience_counter = 0
     save_path = os.path.join(args.save_dir, f"{args.model_name}.pth")
     log_path = os.path.join(args.save_dir, f"{args.model_name}_log.csv")
-    # Setup TensorBoard writer
     writer = SummaryWriter(log_dir=f'runs/{args.model_name}')
 
     print(f"\n--- Starting Model Training for {args.epochs} Epochs ---")
@@ -185,7 +197,7 @@ def main():
     try: # Wrap training loop in try-except for cleaner exit
         with open(log_path, 'w', newline='') as log_file:
             csv_writer = csv.writer(log_file)
-            # Simplified CSV header
+            # Simplified CSV header (removed rw_loss)
             csv_writer.writerow(['epoch', 'lp_loss', 'total_loss', 'val_loss', 'val_auc', 'val_f1', 'val_mrr', 'lr', 'grad_norm'])
 
             # --- Main Epoch Loop ---
@@ -196,17 +208,9 @@ def main():
                 total_grad_norm_epoch = 0
                 num_batches_processed = 0
 
-                # --- Create Train Loader for this Epoch (with 80% sampling) ---
-                all_train_pos = dataset.links.get('train_lp', [])
-                if not all_train_pos:
-                     print("  Warning: No training LP links found. Skipping epoch.")
-                     continue
-                train_dataset_epoch = LinkPredictionDataset(all_train_pos, dataset, sample_ratio=0.8, neg_sample_ratio=1)
-                train_loader_epoch = DataLoader(train_dataset_epoch, batch_size=args.mini_batch_s, shuffle=True)
-                print(f"  > Sampled {len(train_dataset_epoch)} links for training this epoch.")
-
                 # --- Link Prediction Training Phase ---
-                lp_iterator = tqdm(train_loader_epoch, desc="Link Prediction Training", leave=False)
+                # Use the static 'train_loader' created outside the loop
+                lp_iterator = tqdm(train_loader, desc="Link Prediction Training", leave=False)
                 for i, (u_gids, v_gids, labels) in enumerate(lp_iterator):
                     # Move data to device
                     u_gids, v_gids, labels = u_gids.to(device), v_gids.to(device), labels.to(device)
@@ -263,7 +267,7 @@ def main():
                         best_valid_auc = val_metrics['ROC-AUC']
                         patience_counter = 0
                         torch.save(model.state_dict(), save_path)
-                        print(f" New best model saved to {save_path} (AUC: {best_valid_auc:.4f})")
+                        print(f"  ✨ New best model saved to {save_path} (AUC: {best_valid_auc:.4f})")
                     else:
                         patience_counter += 1
                         print(f"  > Validation AUC did not improve. Patience: {patience_counter}/{args.patience}")
@@ -279,6 +283,7 @@ def main():
                     val_metrics['Val_Loss'], val_metrics['ROC-AUC'], val_metrics['F1-Score'], val_metrics['MRR'],
                     current_lr, avg_grad_norm_epoch
                 ]
+                # Removed avg_rw_loss from log_row
                 csv_writer.writerow(log_row)
 
                 writer.add_scalar('Loss/Train_LP', avg_lp_loss_epoch, epoch + 1)
