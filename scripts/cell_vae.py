@@ -80,9 +80,9 @@ if __name__ == '__main__':
 
 
     # Hyperparameters
-    LATENT_DIM = 256
-    LEARNING_RATE = 1e-4
-    EPOCHS = 100
+    LATENT_DIM = 512
+    LEARNING_RATE = 7e-4
+    EPOCHS = 120
     BATCH_SIZE = 64
     DROPOUT_RATE = 0.4
     KL_ANNEAL_EPOCHS = 50
@@ -116,7 +116,7 @@ if __name__ == '__main__':
     # Model setup
     input_dim = expression_data_scaled.shape[1]
     # Architecture definition
-    dims = [input_dim, 10000, 5000, 1000, 500, LATENT_DIM]
+    dims = [input_dim, 10000, 5000, 2048, 1024, LATENT_DIM]
     print(f"Initializing VAE model with architecture: {dims}")
     model = CellLineVAE(dims, dropout_rate=DROPOUT_RATE).to(device)
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)

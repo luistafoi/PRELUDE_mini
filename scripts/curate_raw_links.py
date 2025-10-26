@@ -92,7 +92,7 @@ def curate_gene_drug_links(args):
         # Read only necessary columns
         df = pd.read_csv(dgidb_file, usecols=['gene_name', 'drug_name', 'interaction_type'])        
         # Pre-process interaction types: lowercase and split if multiple types exist per row
-        df.dropna(subset=['interaction_types'], inplace=True) # Drop rows missing interaction types
+        df.dropna(subset=['interaction_type'], inplace=True) # Drop rows missing interaction types
         df['interaction_list'] = df['interaction_type'].str.lower().str.split(',')        
         # Filter rows where at least one interaction type is inhibitory
         print(f"  > Filtering for inhibitory interaction types...")
