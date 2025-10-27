@@ -65,7 +65,7 @@ def loss_function(recon_x, x, mu, logvar, beta=1.0):
 
 if __name__ == '__main__':
     # Define paths relative to project root (assuming script is run from project root)
-    EXPRESSION_FILE = 'data/embeddings/OmicsExpressionProteinCodingGenesTPMLogp1.csv'
+    EXPRESSION_FILE = 'data/misc/24Q2_OmicsExpressionProteinCodingGenesTPMLogp1BatchCorrected.csv'
     OUTPUT_EMBEDDING_FILE = 'data/embeddings/final_vae_cell_embeddings.npy'
     OUTPUT_MODEL_FILE = 'data/embeddings/cell_vae_weights.pth'
     OUTPUT_CELL_LIST_FILE = 'data/embeddings/final_vae_cell_names.txt'
@@ -188,7 +188,7 @@ if __name__ == '__main__':
              
     final_embeddings_mu = torch.cat(final_embeddings_mu, dim=0).numpy()
 
-    np.save(OUTPUT_EMBEDDING_FILE, mu.cpu().numpy())
+    np.save(OUTPUT_EMBEDDING_FILE, final_embeddings_mu)
     print(f"Saved embeddings to: {OUTPUT_EMBEDDING_FILE}")
 
     # --- vvv ADD THIS BLOCK vvv ---
@@ -201,5 +201,4 @@ if __name__ == '__main__':
     # --- ^^^ END BLOCK ^^^ ---
 
     # Save model weights
-    torch.save(model.state_dict(), OUTPUT_MODEL_FILE)
     print(f"Saved model weights to: {OUTPUT_MODEL_FILE}")

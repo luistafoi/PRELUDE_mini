@@ -80,7 +80,7 @@ def main(args):
 
     # --- Configuration ---
     link_paths = {
-        "cell-drug": args.cell_drug_file,
+        "cell-drug": os.path.join(args.raw_dir, "link_cell_drug_labeled.txt"), # Explicitly use the GMM output
         "gene-drug": args.gene_drug_file,
         "gene-cell": os.path.join(args.raw_dir, "link_cell_gene_mutation.txt"),
         "gene-gene": os.path.join(args.raw_dir, "link_gene_gene.txt")
