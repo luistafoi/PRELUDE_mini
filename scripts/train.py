@@ -65,9 +65,33 @@ class LinkPredictionDataset(Dataset):
         v_nodes = [p[1] for p in self.current_epoch_positive_links] + [n[1] for n in self.negative_links]
         labels = [1.0] * len(self.current_epoch_positive_links) + [0.0] * len(self.negative_links)
 
-        self.u_nodes = np.array(u_nodes, dtype=np.int64)
-        self.v_nodes = np.array(v_nodes, dtype=np.int64)
+        self.u_nodes_gid = np.array(u_nodes, dtype=np.int64)
+        self.v_nodes_gid = np.array(v_nodes, dtype=np.int64)
         self.labels = np.array(labels, dtype=np.float32)
+
+        # --- Pre-compute LIDs and Type IDs to speed up training loop ---
+        print("  > Pre-computing LIDs and Type IDs for training set...")
+        self.u_lids = np.zeros_like(self.u_nodes_gid)
+        self.v_lids = np.zeros_like(self.v_nodes_gid)
+        self.u_types = np.zeros_like(self.u_nodes_gid)
+
+        try:
+            for i in range(len(self.u_nodes_gid)):
+                u_gid = self.u_nodes_gid[i]
+                v_gid = self.v_nodes_gid[i]
+                
+                u_type_id, u_lid = self.full_dataset.nodes['type_map'][u_gid]
+                _, v_lid = self.full_dataset.nodes['type_map'][v_gid]
+                
+                self.u_lids[i] = u_lid
+                self.v_lids[i] = v_lid
+                self.u_types[i] = u_type_id
+        except KeyError as e:
+            print(f"FATAL ERROR in LinkPredictionDataset: GID {e} not found in node_types map.")
+            print("This can happen if link files are out of sync with node.dat.")
+            sys.exit(1)
+            
+        print("  > Pre-computing complete.")
 
     def _generate_negative_samples(self):
         neg_links = []
@@ -101,10 +125,11 @@ class LinkPredictionDataset(Dataset):
         return len(self.labels)
 
     def __getitem__(self, idx):
-        # Return tensors directly, move to device in training loop
-        return (torch.tensor(self.u_nodes[idx], dtype=torch.long),
-                torch.tensor(self.v_nodes[idx], dtype=torch.long),
-                torch.tensor(self.labels[idx], dtype=torch.float))
+        # Return pre-computed LIDs and Type IDs
+        return (torch.tensor(self.u_lids[idx], dtype=torch.long),
+                torch.tensor(self.v_lids[idx], dtype=torch.long),
+                torch.tensor(self.labels[idx], dtype=torch.float),
+                torch.tensor(self.u_types[idx], dtype=torch.long))
 
 
 # --- Main Training Function ---
@@ -168,8 +193,11 @@ def main():
          sys.exit(1)
     
     # The 80% sampling and negative sampling happens ONCE here
-    train_dataset = LinkPredictionDataset(all_train_pos, dataset, sample_ratio=0.8, neg_sample_ratio=1)
-    train_loader = DataLoader(train_dataset, batch_size=args.mini_batch_s, shuffle=True, num_workers=8) # Added shuffle & num_workers
+    if args.train_fraction < 1.0:
+        print(f"  > WARNING: Using only {args.train_fraction * 100:.0f}% of training data for speed.")
+    
+    train_dataset = LinkPredictionDataset(all_train_pos, dataset, sample_ratio=args.train_fraction, neg_sample_ratio=1)
+    train_loader = DataLoader(train_dataset, batch_size=args.mini_batch_s, shuffle=True, num_workers=args.num_workers) # Added shuffle & num_workers
     print(f"  > Created training loader with {len(train_dataset)} links.")
 
     # --- Fixed Validation Loader (Created Once) ---
@@ -180,7 +208,7 @@ def main():
     else:
         # Use LinkPredictionDataset with sample_ratio=1.0 for validation
         valid_dataset = LinkPredictionDataset(valid_pos, dataset, sample_ratio=1.0, neg_sample_ratio=1)
-        valid_loader = DataLoader(valid_dataset, batch_size=args.mini_batch_s, num_workers=8) # Added num_workers
+        valid_loader = DataLoader(valid_dataset, batch_size=args.mini_batch_s, num_workers=args.num_workers) # Added num_workers
         print(f"  > Created validation loader with {len(valid_dataset)} links.")
 
     # --- Training Loop & Logging Setup ---
@@ -209,24 +237,18 @@ def main():
                 num_batches_processed = 0
 
                 # --- Link Prediction Training Phase ---
-                # Use the static 'train_loader' created outside the loop
                 lp_iterator = tqdm(train_loader, desc="Link Prediction Training", leave=False)
-                for i, (u_gids, v_gids, labels) in enumerate(lp_iterator):
+                # We now get LIDs and types directly from the parallel loader
+                for i, (u_lids_batch, v_lids_batch, labels_batch, u_types_batch) in enumerate(lp_iterator):
                     # Move data to device
-                    u_gids, v_gids, labels = u_gids.to(device), v_gids.to(device), labels.to(device)
-
-                    # Convert global IDs to local IDs needed by the model
-                    try:
-                        u_lids = [dataset.nodes['type_map'][gid.item()][1] for gid in u_gids]
-                        v_lids = [dataset.nodes['type_map'][gid.item()][1] for gid in v_gids]
-                    except KeyError as e:
-                        print(f"Error: Node ID {e} not found in dataset.nodes['type_map']. Skipping batch {i}.")
-                        continue
-
+                    u_lids, v_lids, labels = u_lids_batch.to(device), v_lids_batch.to(device), labels_batch.to(device)
+                    
                     # Determine drug/cell order
-                    u_type = dataset.nodes['type_map'].get(u_gids[0].item(), [None])[0]
+                    # We only need to check the type of the first node in the batch
+                    u_type_id = u_types_batch[0].item() 
                     drug_type_id = dataset.node_name2type.get('drug', -1)
-                    if u_type == drug_type_id:
+                    
+                    if u_type_id == drug_type_id:
                         drug_lids, cell_lids = u_lids, v_lids
                     else:
                         drug_lids, cell_lids = v_lids, u_lids

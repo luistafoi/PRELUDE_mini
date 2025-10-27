@@ -2,6 +2,8 @@
 
 import sys
 import os
+import pickle
+import random
 from collections import defaultdict
 from tqdm import tqdm # For progress bar
 
@@ -9,23 +11,28 @@ from tqdm import tqdm # For progress bar
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from dataloaders.data_loader import PRELUDEDataset
-from dataloaders.data_generator import DataGenerator # Still needed for its loaded data
+from dataloaders.data_generator import DataGenerator
 
 # --- Configuration ---
-# Ensure these point to the correct processed data directory
 DATA_DIR = "data/processed"
-OUTPUT_FILE = os.path.join(DATA_DIR, "train_neighbors.txt")
+# We'll still write the .txt file for compatibility, but it won't be used by the model
+OUTPUT_TXT_FILE = os.path.join(DATA_DIR, "train_neighbors.txt")
+# THIS IS THE NEW, FAST FILE
+OUTPUT_PKL_FILE = os.path.join(DATA_DIR, "train_neighbors_preprocessed.pkl")
+# This MUST match the 'max_neighbors_per_type' in models/tools.py
+MAX_NEIGHBORS = 10 
+# Use -1 as a padding value (LIDs are always >= 0)
+PAD_VALUE = -1 
 
 # --- Main Script ---
 if __name__ == "__main__":
-    print("This script generates the training neighbor list using DIRECT connections")
-    print("(excluding cell-drug links, as filtered during DataGenerator init).")
-    print(f"Output will be saved to: {OUTPUT_FILE}\n")
+    print("This script generates TWO neighbor files:")
+    print(f"  1. {OUTPUT_TXT_FILE} (Slow string-based, for legacy/debugging)")
+    print(f"  2. {OUTPUT_PKL_FILE} (FAST pre-processed .pkl file for training)")
 
     # --- Load Necessary Data Structures ---
-    print("Loading dataset...")
+    print("\nLoading dataset...")
     try:
-        # PRELUDEDataset loads node info and mappings
         dataset = PRELUDEDataset(DATA_DIR)
     except Exception as e:
         print(f"FATAL ERROR loading PRELUDEDataset: {e}")
@@ -33,72 +40,103 @@ if __name__ == "__main__":
 
     print("Initializing DataGenerator (to access neighbor dictionary)...")
     try:
-        # DataGenerator loads links and builds the filtered self.neighbors
         generator = DataGenerator(DATA_DIR)
     except Exception as e:
         print(f"FATAL ERROR initializing DataGenerator: {e}")
         sys.exit(1)
 
-    # --- Generate Neighbors from generator.neighbors ---
-    print(f"Generating neighbor strings and writing to {OUTPUT_FILE}...")
-    
-    # Check if neighbor dict was built
-    if not hasattr(generator, 'neighbors') or not generator.neighbors:
+    # --- Pre-computation ---
+    if not (hasattr(generator, 'neighbors') and generator.neighbors):
          print("FATAL ERROR: generator.neighbors dictionary not found or is empty.")
-         print("Ensure DataGenerator._build_neighbor_dicts() ran successfully.")
          sys.exit(1)
-         
-    # Check if node mappings exist
-    if not hasattr(dataset, 'nodes') or 'type_map' not in dataset.nodes:
+    if not (hasattr(dataset, 'nodes') and 'type_map' in dataset.nodes):
          print("FATAL ERROR: dataset.nodes['type_map'] not found.")
          sys.exit(1)
-    if not hasattr(dataset, 'node_type2name'):
-         print("FATAL ERROR: dataset.node_type2name mapping not found.")
-         sys.exit(1)
 
+    print(f"\nPre-processing neighbors (padding/sampling to {MAX_NEIGHBORS})...")
+    
+    # This will be our final dictionary
+    # Format: {(center_type_id, center_local_id): {neighbor_type_id: [padded_list_of_lids]}}
+    precomputed_neighbors_dict = {}
+    
+    # We also still write the text file for the old loader
+    txt_file_lines = []
 
-    lines_written = 0
-    with open(OUTPUT_FILE, "w") as f:
-        # Iterate through all nodes defined in the dataset's node.dat
-        for center_global_id in tqdm(sorted(dataset.id2node.keys()), desc="Processing nodes"):
+    all_node_type_ids = sorted(dataset.nodes['count'].keys())
+    
+    # A fallback empty structure for nodes with no neighbors
+    empty_padded_neighbors_by_type = {
+        nt_id: [PAD_VALUE] * MAX_NEIGHBORS for nt_id in all_node_type_ids
+    }
+
+    # Iterate through all nodes defined in the dataset's node.dat
+    for center_global_id in tqdm(sorted(dataset.id2node.keys()), desc="Pre-processing nodes"):
+        
+        center_info = dataset.nodes['type_map'].get(center_global_id)
+        if center_info is None: continue
+        
+        center_type_id, center_local_id = center_info
+        center_type_name = dataset.node_type2name.get(center_type_id)
+        if center_type_name is None: continue
+        
+        center_node_str_key = f"{center_type_name}{center_local_id}"
+
+        # 1. Parse all neighbors from strings to (type_id, local_id)
+        # This dict will hold {neighbor_type_id: [list_of_neighbor_lids]}
+        parsed_neighbors_by_type = defaultdict(list)
+        
+        neighbor_strings_for_txt_file = [] # For the old file
+
+        if center_global_id in generator.neighbors:
+            for rtype, target_gids in generator.neighbors[center_global_id].items():
+                for neighbor_global_id in target_gids:
+                    neighbor_info = dataset.nodes['type_map'].get(neighbor_global_id)
+                    if neighbor_info:
+                        neighbor_type_id, neighbor_local_id = neighbor_info
+                        # Add the LID to our new dict
+                        parsed_neighbors_by_type[neighbor_type_id].append(neighbor_local_id)
+                        
+                        # Add the string to the old list
+                        neighbor_type_name = dataset.node_type2name.get(neighbor_type_id)
+                        if neighbor_type_name:
+                             neighbor_strings_for_txt_file.append(f"{neighbor_type_name}{neighbor_local_id}")
+
+        # 2. Apply Sampling & Padding to the parsed LIDs
+        padded_neighbors_for_node = {}
+
+        for nt_id in all_node_type_ids:
+            neigh_list = parsed_neighbors_by_type.get(nt_id, [])
             
-            # Get center node's type and local ID
-            center_info = dataset.nodes['type_map'].get(center_global_id)
-            if center_info is None:
-                print(f"Warning: Skipping node {center_global_id}, not found in type_map.")
-                continue
-            center_type, center_local_id = center_info
-            center_type_name = dataset.node_type2name.get(center_type)
-            if center_type_name is None:
-                 print(f"Warning: Skipping node {center_global_id}, unknown type {center_type}.")
-                 continue
-            center_node_str = f"{center_type_name}{center_local_id}"
+            if len(neigh_list) > MAX_NEIGHBORS:
+                # Sample
+                padded_list = random.sample(neigh_list, MAX_NEIGHBORS)
+            elif 0 < len(neigh_list) <= MAX_NEIGHBORS:
+                # Pad
+                padded_list = neigh_list + [PAD_VALUE] * (MAX_NEIGHBORS - len(neigh_list))
+            else:
+                # All padding
+                padded_list = [PAD_VALUE] * MAX_NEIGHBORS
+            
+            padded_neighbors_for_node[nt_id] = padded_list
+            
+        # 3. Save to our new dictionary
+        precomputed_neighbors_dict[(center_type_id, center_local_id)] = padded_neighbors_for_node
+        
+        # 4. Save to the old .txt file list
+        if neighbor_strings_for_txt_file:
+            unique_sorted_neighbors = sorted(list(set(neighbor_strings_for_txt_file)))
+            txt_file_lines.append(f"{center_node_str_key}:{','.join(unique_sorted_neighbors)}\n")
 
-            # Aggregate all direct neighbors from the filtered generator.neighbors
-            all_neighbor_global_ids = []
-            if center_global_id in generator.neighbors:
-                for rtype, target_gids in generator.neighbors[center_global_id].items():
-                    all_neighbor_global_ids.extend(target_gids)
+    # --- Save PKL File ---
+    print(f"\nSaving pre-processed neighbors to {OUTPUT_PKL_FILE}...")
+    with open(OUTPUT_PKL_FILE, "wb") as f:
+        pickle.dump(precomputed_neighbors_dict, f)
+    print("  > .pkl file saved.")
 
-            # Convert neighbor global IDs to strings ("type_name" + "local_id")
-            neighbor_strings = []
-            for neighbor_global_id in all_neighbor_global_ids:
-                neighbor_info = dataset.nodes['type_map'].get(neighbor_global_id)
-                if neighbor_info:
-                    neighbor_type, neighbor_local_id = neighbor_info
-                    neighbor_type_name = dataset.node_type2name.get(neighbor_type)
-                    if neighbor_type_name:
-                        neighbor_strings.append(f"{neighbor_type_name}{neighbor_local_id}")
-                    # else: # Should not happen if data is consistent
-                    #     print(f"Warning: Unknown type {neighbor_type} for neighbor {neighbor_global_id}")
-                # else: # Should not happen if data is consistent
-                #     print(f"Warning: Neighbor {neighbor_global_id} not in type_map.")
+    # --- Save TXT File ---
+    print(f"Saving legacy string neighbors to {OUTPUT_TXT_FILE}...")
+    with open(OUTPUT_TXT_FILE, "w") as f:
+        f.writelines(txt_file_lines)
+    print(f"  > .txt file saved ({len(txt_file_lines)} nodes).")
 
-
-            if neighbor_strings:
-                # Make unique and sort (optional, but good for consistency)
-                unique_sorted_neighbors = sorted(list(set(neighbor_strings)))
-                f.write(f"{center_node_str}:{','.join(unique_sorted_neighbors)}\n")
-                lines_written += 1
-
-    print(f"\nGeneration complete. Wrote neighbor lists for {lines_written} nodes to {OUTPUT_FILE}.")
+    print("\nGeneration complete.")

@@ -14,6 +14,8 @@ def read_args():
                         help='Full path to a saved model checkpoint to load for evaluation.')
     parser.add_argument('--gpu', type=int, default=0,
                         help='GPU device ID to use.')
+    parser.add_argument('--num_workers', type=int, default=8,
+                        help='Number of dataloader workers.')
 
     # --- Model Architecture Arguments ---
     parser.add_argument('--embed_d', type=int, default=256,
@@ -30,6 +32,8 @@ def read_args():
                         help='Adam optimizer weight decay.')
     parser.add_argument('--mini_batch_s', type=int, default=256,
                         help='Mini-batch size for link prediction training.')
+    parser.add_argument('--train_fraction', type=float, default=0.8,
+                        help='Fraction of training data to use per epoch (e.g., 0.1 for 10%).')
     parser.add_argument('--patience', type=int, default=50,
                         help='Patience for early stopping (in validation checks).')
     parser.add_argument('--val_freq', type=int, default=1,
