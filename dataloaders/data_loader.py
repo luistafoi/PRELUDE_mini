@@ -14,15 +14,17 @@ class PRELUDEDataset:
         if not os.path.exists(data_dir):
             print(f"FATAL ERROR: Dataset directory not found at {data_dir}")
             sys.exit(1)
-            
+
         self.info = self._load_info()
-        
+
         # Dictionary to hold graph structure and pre-split links
         self.links = {
             'graph': defaultdict(list), # Structural links for GNN message passing
             'train_lp': [],             # Positive links for LP training
             'train_lp_set': set(),      # Set version for faster negative sampling checks
-            'valid_inductive': [],      # Validation links (inductive)
+            'validation': [],           # Generic key for the active validation set
+            'valid_inductive': [],      # Validation links (inductive) - kept for potential fallback
+            'valid_transductive': [],   # Validation links (transductive) - NEW
             'test_transductive': [],    # Test links (transductive, if file exists)
             'test_inductive': [],       # Test links (inductive)
         }
@@ -39,7 +41,7 @@ class PRELUDEDataset:
         # Load structural links used for message passing
         self._load_graph_links()
 
-        # Load pre-split link prediction sets
+        # Load pre-split link prediction sets (UPDATED LOGIC HERE)
         self._load_lp_splits()
 
         # Build map for local_id -> global_id (might be useful)
@@ -70,11 +72,11 @@ class PRELUDEDataset:
         if not os.path.exists(path):
             print(f"FATAL ERROR: node.dat not found at {path}")
             sys.exit(1)
-            
+
         self.node2id = {}
         self.id2node = {}
         self.node_types = {} # Maps global_id -> type_id
-        
+
         try:
             with open(path, 'r') as f:
                 for line in f:
@@ -102,7 +104,7 @@ class PRELUDEDataset:
             type_map[nid] = (ntype, local_id)
             local_type_counters[ntype] += 1
             type_counts[ntype] += 1
-            
+
         self.nodes = {
             'count': dict(type_counts),
             'type_map': type_map # Keep as dict for direct gid lookup
@@ -114,7 +116,7 @@ class PRELUDEDataset:
         if not os.path.exists(path):
             print(f"Warning: Structural link file train.dat not found at {path}. GNN message passing will be limited.")
             return
-            
+
         count = 0
         try:
             with open(path, 'r') as f:
@@ -137,30 +139,62 @@ class PRELUDEDataset:
         print("Loading pre-split link prediction data...")
         split_names = {
             'train_lp': 'train_lp_links.dat',
+            # --- START FIX ---
+            # Define potential validation/test files
+            'valid_transductive': 'valid_transductive_links.dat',
             'valid_inductive': 'valid_inductive_links.dat',
-            'test_transductive': 'test_transductive_links.dat', # Keep loading if exists
+            'test_transductive': 'test_transductive_links.dat',
             'test_inductive': 'test_inductive_links.dat',
+            # --- END FIX ---
         }
+
+        # --- Load the files ---
+        loaded_validation_key = None # Track which validation file was loaded
         for split_key, filename in split_names.items():
             path = os.path.join(self.data_dir, filename)
             if os.path.exists(path):
                 try:
+                    loaded_links = []
                     with open(path, 'r') as f:
                         for line in f:
                             parts = line.strip().split('\t')
-                            # Assuming format: src_gid, tgt_gid, [optional type], [optional label]
+                            # Assuming format: src_gid, tgt_gid
                             if len(parts) >= 2:
-                                self.links[split_key].append(
-                                    (int(parts[0]), int(parts[1])) # Store as (src_gid, tgt_gid) tuple
-                                )
-                    print(f"  > Loaded {len(self.links[split_key])} links for {split_key}")
-                    # Create the set version for training links
+                                src, tgt = int(parts[0]), int(parts[1])
+                                # Ensure nodes exist before adding link
+                                if src in self.id2node and tgt in self.id2node:
+                                    loaded_links.append((src, tgt))
+
+                    self.links[split_key] = loaded_links # Store loaded links
+                    print(f"  > Loaded {len(loaded_links)} links for {split_key}")
+
+                    # If this is a validation file, remember which one we loaded
+                    # Prioritize transductive if both exist somehow
+                    if split_key == 'valid_transductive':
+                        loaded_validation_key = split_key
+                    elif split_key == 'valid_inductive' and loaded_validation_key is None: # Only load inductive if transductive wasn't found
+                         loaded_validation_key = split_key
+
+                    # Special handling for train_lp set
                     if split_key == 'train_lp':
-                        self.links['train_lp_set'] = set(self.links['train_lp'])
+                        self.links['train_lp_set'] = set(loaded_links)
+
                 except Exception as e:
                     print(f"Error reading {filename}: {e}")
             else:
-                print(f"  > Info: Link file not found for split '{split_key}' at {path}. Split will be empty.")
+                 # Only print info for missing test files, others might be expected depending on split type
+                 if 'test' in split_key or 'valid' in split_key: # Be slightly more verbose about missing val/test
+                      print(f"  > Info: Link file not found for split '{split_key}' at {path}. Split will be empty.")
+
+        # --- Add a specific key for the active validation set ---
+        # This makes train.py and evaluate.py simpler, they can just ask for 'validation'
+        if loaded_validation_key:
+             self.links['validation'] = self.links[loaded_validation_key]
+             print(f"  > Using '{loaded_validation_key}' ({len(self.links['validation'])} links) as the active validation set.")
+        else:
+             self.links['validation'] = []
+             print(f"  > Warning: No validation link file found ('valid_transductive_links.dat' or 'valid_inductive_links.dat').")
+
 
     def _build_local_to_global_map(self):
         """Builds mapping from (type, local_id) back to global_id."""
@@ -186,15 +220,15 @@ class PRELUDEDataset:
             for ltype_str, type_info in self.info['link.dat'].items():
                 ltype = int(ltype_str)
                 src_name, tgt_name = type_info[0], type_info[1]
-                
+
                 # Check if names exist in name2type mapping
                 if src_name not in self.node_name2type or tgt_name not in self.node_name2type:
                      print(f"Warning: Node names '{src_name}' or '{tgt_name}' for link type {ltype} not found in node types. Skipping this link type lookup.")
                      continue
-                     
+
                 src_type = self.node_name2type[src_name]
                 tgt_type = self.node_name2type[tgt_name]
-                
+
                 # Store lookup for both directions if symmetrical type names used
                 self.link_type_lookup[(src_type, tgt_type)] = ltype
                 # Add reverse only if source and target types are different,
@@ -211,8 +245,10 @@ class PRELUDEDataset:
         if not self.nodes or not self.nodes.get('count'):
              print("No node data loaded.")
              return
-             
-        print(f"\nNodes ({self.nodes.get('total', sum(self.nodes.get('count', {}).values()))} total):")
+
+        # Calculate total nodes correctly
+        total_nodes = sum(self.nodes.get('count', {}).values())
+        print(f"\nNodes ({total_nodes} total):")
         for ntype_id, count in sorted(self.nodes.get('count', {}).items()):
             ntype_name = self.node_type2name.get(ntype_id, f"Type {ntype_id}")
             print(f"  - {ntype_name.capitalize()} (Type {ntype_id}): {count} nodes")
@@ -223,10 +259,12 @@ class PRELUDEDataset:
 
         print(f"\nLink Prediction Splits:")
         print(f"  - Training LP Set:       {len(self.links.get('train_lp', []))} links")
-        print(f"  - Validation (Inductive): {len(self.links.get('valid_inductive', []))} links")
+        # --- START FIX ---
+        # Print the active validation set size
+        print(f"  - Validation Set ('validation'): {len(self.links.get('validation', []))} links")
+        # Optionally print the specific files found for clarity
+        print(f"    (Found valid_inductive: {len(self.links.get('valid_inductive', []))}, Found valid_transductive: {len(self.links.get('valid_transductive', []))})")
+        # --- END FIX ---
         print(f"  - Test (Transductive):    {len(self.links.get('test_transductive', []))} links")
         print(f"  - Test (Inductive):       {len(self.links.get('test_inductive', []))} links")
         print("---------------------------------")
-
-    # --- Methods removed ---
-    # _load_cell_features is removed.
