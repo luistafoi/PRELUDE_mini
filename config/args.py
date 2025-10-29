@@ -34,7 +34,7 @@ def read_args():
                         help='Mini-batch size for link prediction training.')
     parser.add_argument('--train_fraction', type=float, default=0.8,
                         help='Fraction of training data to use per epoch (e.g., 0.1 for 10%).')
-    parser.add_argument('--patience', type=int, default=50,
+    parser.add_argument('--patience', type=int, default=20,
                         help='Patience for early stopping (in validation checks).')
     parser.add_argument('--val_freq', type=int, default=1,
                         help='How often to run validation (in epochs).')
