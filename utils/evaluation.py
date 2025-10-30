@@ -16,6 +16,7 @@ def evaluate_model(model, data_loader, generator: DataGenerator, device, dataset
     """
     Evaluates the model on a given dataloader (validation or test).
     Calculates ROC-AUC, F1-Score, and MRR. Assumes dataloader yields (u_lids, v_lids, labels, u_types).
+    NOW RETURNS: metrics dict, true labels array, predicted probabilities array
     """
     model.eval()
     all_preds = []
@@ -31,11 +32,9 @@ def evaluate_model(model, data_loader, generator: DataGenerator, device, dataset
 
     with torch.no_grad():
         pbar = tqdm(data_loader, desc="Evaluating", leave=False)
-        
-        # --- START FIX ---
+
         # Unpack 4 items now: u_lids, v_lids, labels, u_types
         for u_lids_batch, v_lids_batch, labels_batch, u_types_batch in pbar:
-        # --- END FIX ---
 
             # Move data to device
             u_lids_batch, v_lids_batch, labels_batch = u_lids_batch.to(device), v_lids_batch.to(device), labels_batch.to(device)
@@ -87,14 +86,18 @@ def evaluate_model(model, data_loader, generator: DataGenerator, device, dataset
     # --- Calculate Metrics ---
     metrics = {"Val_Loss": np.nan, "ROC-AUC": 0.0, "F1-Score": 0.0, "MRR": 0.0} # Initialize with defaults
 
-    if not all_labels or len(np.unique(all_labels)) < 2:
+    # Convert lists to numpy arrays once
+    all_labels_np = np.array(all_labels)
+    all_preds_np = np.array(all_preds)
+
+    if all_labels_np.size == 0 or len(np.unique(all_labels_np)) < 2:
         print("Warning: Not enough data or distinct labels found for metric calculation.")
-        return metrics
+        # Return empty arrays along with default metrics
+        return metrics, all_labels_np, all_preds_np
 
     try:
-        metrics["ROC-AUC"] = roc_auc_score(all_labels, all_preds)
-        # Use a threshold of 0.5 for F1 score calculation
-        metrics["F1-Score"] = f1_score(np.array(all_labels), np.array(all_preds) > 0.5)
+        metrics["ROC-AUC"] = roc_auc_score(all_labels_np, all_preds_np)
+        metrics["F1-Score"] = f1_score(all_labels_np, all_preds_np > 0.5)
     except ValueError as e:
          print(f"Warning: Could not calculate AUC/F1: {e}")
 
@@ -117,4 +120,5 @@ def evaluate_model(model, data_loader, generator: DataGenerator, device, dataset
     # Loss is no longer calculated here, return NaN
     metrics["Val_Loss"] = np.nan
 
-    return metrics
+    # Return the collected labels and predictions along with the metrics
+    return metrics, all_labels_np, all_preds_np

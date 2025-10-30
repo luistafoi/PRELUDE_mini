@@ -7,6 +7,11 @@ from torch.utils.data import DataLoader
 import numpy as np
 import argparse # Import argparse
 
+# --- START FIX: Add imports for plotting ---
+import matplotlib.pyplot as plt
+from sklearn.metrics import roc_curve, auc
+# --- END FIX ---
+
 # Add project root to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -71,7 +76,7 @@ def main():
 
     model.eval() # Set model to evaluation mode
 
-    # --- START FIX: Determine Which Test Set to Use ---
+    # --- Determine Which Test Set to Use ---
     test_pos = None
     test_set_name = "None"
     test_set_key = "None"
@@ -88,26 +93,63 @@ def main():
         test_set_key = 'test_inductive'
 
     print(f"\n--- Evaluating on {test_set_name} ---")
-    # --- END FIX ---
 
     if test_pos:
         # Use LinkPredictionDataset to handle positive links and generate negatives
         # Using sample_ratio=1.0 to get all positive links for evaluation
         test_dataset = LinkPredictionDataset(test_pos, dataset, sample_ratio=1.0, neg_sample_ratio=1) # 1:1 neg sampling
         # Use num_workers from args for consistency
+        # Ensure mini_batch_s from args is used here as well
         test_loader = DataLoader(test_dataset, batch_size=args.mini_batch_s, num_workers=args.num_workers)
 
         print(f"  > Evaluating on {len(test_dataset)} links ({len(test_pos)} positive from '{test_set_key}_links.dat').")
 
-        # Call the evaluation function from utils
-        test_metrics = evaluate_model(model, test_loader, generator, device, dataset)
+        # Call the evaluation function and unpack all three return values
+        test_metrics, true_labels, pred_probs = evaluate_model(model, test_loader, generator, device, dataset)
 
+        # Print scalar metrics
         print(f"\n--- {test_set_name} Performance ---")
-        # Loss is NaN as it's not calculated in evaluate_model
         print(f"  ROC-AUC:  {test_metrics['ROC-AUC']:.4f}")
         print(f"  F1-Score: {test_metrics['F1-Score']:.4f}")
         print(f"  MRR:      {test_metrics['MRR']:.4f}")
         print("------------------------------------")
+
+        # Generate and Save ROC Curve Plot
+        # Check if we have valid data for plotting
+        if true_labels.size > 0 and pred_probs.size > 0 and len(np.unique(true_labels)) > 1:
+            try:
+                fpr, tpr, thresholds = roc_curve(true_labels, pred_probs)
+                # Use the AUC calculated by evaluate_model for consistency
+                roc_auc_value = test_metrics.get('ROC-AUC', auc(fpr, tpr)) # Fallback
+
+                plt.figure(figsize=(6, 6))
+                plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (AUC = {roc_auc_value:.3f})')
+                plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+                plt.xlim([0.0, 1.0])
+                plt.ylim([0.0, 1.05])
+                plt.xlabel('False Positive Rate')
+                plt.ylabel('True Positive Rate')
+                plt.title(f'ROC Curve - {test_set_name}')
+                plt.legend(loc="lower right")
+                plt.grid(alpha=0.5)
+
+                # Determine save directory (use save_dir from args)
+                save_dir = args.save_dir if hasattr(args, 'save_dir') else 'checkpoints'
+                # Use model_name from args if available, otherwise derive from load_path
+                model_base_name = args.model_name if hasattr(args, 'model_name') and args.model_name else os.path.splitext(os.path.basename(args.load_path))[0]
+
+                plot_filename = os.path.join(save_dir, f"{model_base_name}_{test_set_key}_roc_curve.pdf")
+                # Ensure save directory exists
+                os.makedirs(save_dir, exist_ok=True)
+                plt.savefig(plot_filename, dpi=300, bbox_inches='tight')
+                print(f"ROC curve plot saved to: {plot_filename}")
+                plt.close() # Close the figure window
+
+            except Exception as e:
+                print(f"Error generating or saving ROC plot: {e}")
+        else:
+            print("Skipping ROC plot generation due to insufficient data or labels.")
+
     else:
         # Update warning message
         print(f"  > No test links found ('test_transductive_links.dat' or 'test_inductive_links.dat'). Skipping evaluation.")
