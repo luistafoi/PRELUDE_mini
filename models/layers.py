@@ -1,0 +1,198 @@
+# models/layers.py
+
+import torch
+import torch.nn as nn
+import random
+
+
+class HetGNNLayer(nn.Module):
+    """
+    A single layer of the Heterogeneous GNN that uses weighted mean-pooling
+    for neighbor aggregation and semantic attention to combine information
+    from different node types. Replaces RNN with:
+      - Per-type nn.Linear transforms for neighbor messages
+      - Mask-aware weighted mean-pool (handles padded -1 entries)
+      - nn.LayerNorm before output for stable multi-hop training
+    """
+    def __init__(self, in_dim, out_dim, node_types, dropout_rate=0.4):
+        super(HetGNNLayer, self).__init__()
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.node_types = node_types
+
+        # Per-type linear transforms for neighbor messages
+        self.message_transforms = nn.ModuleDict({
+            str(nt): nn.Linear(in_dim, in_dim) for nt in self.node_types
+        })
+
+        # Semantic-level attention (same as original)
+        self.sem_att = nn.Linear(in_dim * 2, 1, bias=False)
+
+        self.layer_norm = nn.LayerNorm(in_dim)
+        self.act = nn.LeakyReLU()
+        self.dropout = nn.Dropout(dropout_rate)
+        self._init_weights()
+
+    def _init_weights(self):
+        """Initializes weights using Xavier Uniform."""
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+    def forward(self, current_embeds, neigh_embeds_by_type, neigh_masks_by_type=None,
+                neigh_weight_sums_by_type=None):
+        """
+        Args:
+            current_embeds (Tensor): Embeddings of the central nodes. Shape: (batch_size, in_dim)
+            neigh_embeds_by_type (dict): Keys are node type IDs (int), values are
+                tensors of neighbor embeddings. Shape: (batch_size, num_neighbors, in_dim)
+            neigh_masks_by_type (dict or None): Keys are node type IDs, values are
+                boolean tensors (batch_size, num_neighbors) where True = valid neighbor.
+                If None, all neighbors are treated as valid.
+            neigh_weight_sums_by_type (dict or None): Keys are node type IDs, values are
+                (batch_size,) tensors of sum(edge_weight * mask) for each center node.
+                When provided for a type, denominator becomes sum-of-weights instead of
+                neighbor count (proper weighted mean). Types not in the dict keep the
+                count-based biased mean.
+        Returns:
+            Tensor: Updated embeddings for the central nodes. Shape: (batch_size, out_dim)
+        """
+        agg_embeds_by_type = {}
+
+        for n_type, neigh_feats in neigh_embeds_by_type.items():
+            if neigh_feats.nelement() == 0:
+                agg_embeds_by_type[n_type] = torch.zeros_like(current_embeds)
+                continue
+
+            # Apply per-type linear transform
+            transformed = self.message_transforms[str(n_type)](neigh_feats)  # (B, M, D)
+
+            # Mask-aware pool. When a weight-sum is provided for this type, use proper
+            # weighted mean (denominator = sum of weights); else fall back to count-based.
+            if neigh_masks_by_type is not None and n_type in neigh_masks_by_type:
+                mask = neigh_masks_by_type[n_type].unsqueeze(-1).float()  # (B, M, 1)
+                numerator = (transformed * mask).sum(dim=1)  # (B, D)
+                if neigh_weight_sums_by_type is not None and n_type in neigh_weight_sums_by_type:
+                    denom = neigh_weight_sums_by_type[n_type].unsqueeze(-1).clamp(min=1e-6)
+                else:
+                    denom = mask.sum(dim=1).clamp(min=1.0)  # (B, 1)
+                pooled = numerator / denom
+            else:
+                pooled = transformed.mean(dim=1)  # (B, D)
+
+            agg_embeds_by_type[n_type] = pooled
+
+        # Semantic Attention (same logic as original)
+        sem_att_inputs = [torch.cat((current_embeds, current_embeds), dim=1)]  # Self-loop
+        sem_att_keys_ordered = sorted(agg_embeds_by_type.keys())
+        sem_att_inputs.extend([
+            torch.cat((current_embeds, agg_embeds_by_type[nt]), dim=1)
+            for nt in sem_att_keys_ordered
+        ])
+
+        sem_att_stack = torch.stack(sem_att_inputs, dim=1)
+        att_weights = self.sem_att(sem_att_stack).squeeze(-1)
+        att_weights = torch.softmax(att_weights, dim=1).unsqueeze(-1)
+
+        embeds_to_combine = [current_embeds] + [agg_embeds_by_type[nt] for nt in sem_att_keys_ordered]
+        embeds_stack = torch.stack(embeds_to_combine, dim=1)
+        updated_embeds = torch.sum(att_weights * embeds_stack, dim=1)
+
+        # LayerNorm + activation + dropout
+        updated_embeds = self.layer_norm(updated_embeds)
+        return self.dropout(self.act(updated_embeds))
+
+
+class RnnGnnLayer(nn.Module):
+    """(DEPRECATED — use HetGNNLayer instead)"""
+    """
+    A single layer of the Heterogeneous GNN that uses an RNN for neighbor aggregation
+    and semantic attention to combine information from different node types.
+    """
+    def __init__(self, in_dim, out_dim, node_types, dropout_rate=0.4):
+        super(RnnGnnLayer, self).__init__()
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.node_types = node_types # Expecting list/set of integer type IDs
+
+        # RNN for aggregating neighbors of each type
+        self.rnn_aggregators = nn.ModuleDict({
+            # Use string keys for ModuleDict
+            str(nt): nn.RNN(in_dim, in_dim, batch_first=True) for nt in self.node_types
+        })
+        
+        # Semantic-level attention
+        self.sem_att = nn.Linear(in_dim * 2, 1, bias=False)
+        
+        self.act = nn.LeakyReLU()
+        self.dropout = nn.Dropout(dropout_rate)
+         # Optional: Add weight initialization if desired
+        self._init_weights()
+
+    def _init_weights(self):
+        """Initializes weights using Xavier Uniform."""
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                     nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.RNN):
+                 for name, param in module.named_parameters():
+                     if 'weight_ih' in name:
+                         nn.init.xavier_uniform_(param.data)
+                     elif 'weight_hh' in name:
+                         nn.init.orthogonal_(param.data)
+                     elif 'bias' in name:
+                         param.data.fill_(0)
+
+
+    def forward(self, current_embeds, neigh_embeds_by_type):
+        """
+        Args:
+            current_embeds (Tensor): Embeddings of the central nodes. Shape: (batch_size, in_dim)
+            neigh_embeds_by_type (dict): Keys are node type IDs (int), values are
+                                         tensors of neighbor embeddings.
+                                         Shape of each value: (batch_size, num_samples, in_dim)
+        Returns:
+            Tensor: Updated embeddings for the central nodes. Shape: (batch_size, out_dim)
+        """
+        agg_embeds_by_type = {}
+        
+        # Aggregate neighbors for each type using RNN
+        for n_type, neigh_feats in neigh_embeds_by_type.items():
+            if neigh_feats.nelement() > 0: # Check if tensor is not empty
+                # Pass neighbor features through RNN. We only care about the last hidden state.
+                _, last_hidden = self.rnn_aggregators[str(n_type)](neigh_feats)
+                agg_embeds_by_type[n_type] = last_hidden.squeeze(0) # Squeeze batch dim
+            else:
+                # Handle cases with no neighbors of this type: use zero vector
+                agg_embeds_by_type[n_type] = torch.zeros_like(current_embeds)
+        
+        # Semantic Attention
+        # Create pairs of (center_node_embedding, aggregated_neighbor_embedding)
+        sem_att_inputs = [torch.cat((current_embeds, current_embeds), dim=1)] # Self-loop
+        sem_att_keys_ordered = sorted(agg_embeds_by_type.keys()) # Ensure consistent order
+        sem_att_inputs.extend([
+            torch.cat((current_embeds, agg_embeds_by_type[nt]), dim=1) 
+            for nt in sem_att_keys_ordered
+        ])
+        
+        # Stack for parallel attention calculation
+        sem_att_stack = torch.stack(sem_att_inputs, dim=1)
+        
+        # Calculate attention weights and apply softmax
+        att_weights = self.sem_att(sem_att_stack).squeeze(-1) # Shape: (batch_size, num_types + 1)
+        att_weights = torch.softmax(att_weights, dim=1).unsqueeze(-1) # Shape: (batch_size, num_types + 1, 1)
+        
+        # Weighted sum of embeddings (including self-loop)
+        embeds_to_combine = [current_embeds] + [agg_embeds_by_type[nt] for nt in sem_att_keys_ordered]
+        embeds_stack = torch.stack(embeds_to_combine, dim=1) # Shape: (batch_size, num_types + 1, in_dim)
+        
+        # The new embedding is the attention-weighted sum
+        updated_embeds = torch.sum(att_weights * embeds_stack, dim=1) # Shape: (batch_size, in_dim)
+        
+        # Apply activation and dropout
+        # Note: If in_dim != out_dim, a Linear layer would be needed here. Assumed in_dim == out_dim
+        return self.dropout(self.act(updated_embeds))
