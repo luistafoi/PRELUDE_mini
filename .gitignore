@@ -31,15 +31,13 @@ models/scGPT_human/
 # Notebooks scratch space
 notebooks/
 
-# Experiment artifacts (old / unused shell scripts)
-run_I*.sh
-run_M0[0-8].sh
-run_M10*.sh
-run_sanger_eval.sh
-run_golden_model.sh
-run_inductive_*.sh
-run_tuning.sh
-run_all_sanger.sh
+# Personal project instructions (not part of reproducibility)
+CLAUDE.md
+
+# Experiment run scripts (personal / per-machine, not reproducibility surface)
+run_*.sh
+
+# Experiment artifacts
 best_params_*.json
 prelude_tuning.db
 Created
