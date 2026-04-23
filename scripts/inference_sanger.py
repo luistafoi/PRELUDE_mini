@@ -89,8 +89,14 @@ def load_sanger_links(data_dir, scenario):
     return links
 
 
-def evaluate(model, data_loader, generator, device, dataset):
-    """Run evaluation, return metrics + results DataFrame."""
+def evaluate(model, data_loader, generator, device, dataset, use_inductive_head=False):
+    """Run evaluation, return metrics + results DataFrame.
+
+    Args:
+        use_inductive_head: For dual-head models, pass True for S2/S3/S4
+            (any scenario with new cells or drugs) so inductive head is used.
+            S1 (known cells + known drugs) should use transductive head.
+    """
     model.eval()
 
     all_pred_probs = []
@@ -120,7 +126,10 @@ def evaluate(model, data_loader, generator, device, dataset):
                 drug_lids, cell_lids = v_lids_b, u_lids_b
                 drug_gids, cell_gids = v_gids_b, u_gids_b
 
-            preds = model.link_prediction_forward(drug_lids, cell_lids, generator)
+            preds = model.link_prediction_forward(
+                drug_lids, cell_lids, generator,
+                use_inductive_head=use_inductive_head,
+            )
 
             all_pred_probs.extend(preds.cpu().numpy())
             all_true_labels.extend(labels_b.numpy())
@@ -270,7 +279,10 @@ def main():
 
     # --- Evaluate ---
     print(f"\n--- Running evaluation ({args.scenario}) ---")
-    metrics, results_df = evaluate(model, eval_loader, generator, device, dataset)
+    # Use inductive head for scenarios with new cells or new drugs; S1 stays transductive
+    use_inductive = args.scenario != 'S1'
+    metrics, results_df = evaluate(model, eval_loader, generator, device, dataset,
+                                   use_inductive_head=use_inductive)
 
     # --- Report ---
     print(f"\n{'='*50}")

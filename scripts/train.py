@@ -276,9 +276,21 @@ def main():
     print(f"Loading dataset from: {args.data_dir}")
     try:
         dataset = PRELUDEDataset(args.data_dir, regression=getattr(args, 'regression', False))
+        # Prefer embeddings colocated with the data dir (e.g. data/processed_v2/embeddings);
+        # fall back to default data/embeddings (v1 path).
+        candidate_emb = os.path.join(args.data_dir, "embeddings")
+        embedding_dir = candidate_emb if os.path.isdir(candidate_emb) else "data/embeddings"
+        print(f"  > Embedding dir: {embedding_dir}")
         feature_loader = FeatureLoader(dataset, device,
+                                       embedding_dir=embedding_dir,
                                        cell_feature_source=getattr(args, 'cell_feature_source', 'vae'))
-        generator = DataGenerator(args.data_dir)
+        # DataGenerator's in-memory neighbors aren't used at training time (GNN reads
+        # from the pre-processed pickle). Still instantiate with the correct flags for
+        # consistency so any future code path sees the same graph the pickle was built from.
+        generator = DataGenerator(
+            args.data_dir,
+            include_cell_drug=getattr(args, 'include_cell_drug', False),
+        )
     except Exception as e:
         print(f"FATAL ERROR during data/feature loading: {e}")
         sys.exit(1)
@@ -329,10 +341,17 @@ def main():
     # 2. Triplet Loader
     train_loader_triplet = None
     if args.use_triplet_loss:
-        triplet_map_file = os.path.join(args.data_dir, "cell_triplet_map.pkl")
+        # Prefer cell-drug triplet map (v2), fall back to plain cell triplet map (v1)
+        triplet_map_file = os.path.join(args.data_dir, "cell_drug_triplet_map.pkl")
+        if not os.path.exists(triplet_map_file):
+            triplet_map_file = os.path.join(args.data_dir, "cell_triplet_map.pkl")
         if os.path.exists(triplet_map_file):
             with open(triplet_map_file, "rb") as f:
-                triplet_map = pickle.load(f)
+                triplet_data = pickle.load(f)
+            # Handle both formats: raw dict or {'triplet_map': dict}
+            triplet_map = (triplet_data.get('triplet_map', triplet_data)
+                           if isinstance(triplet_data, dict) and 'triplet_map' in triplet_data
+                           else triplet_data)
             name2gid = {name.upper(): gid for name, gid in dataset.node2id.items()}
             train_dataset_triplet = TripletDataset(triplet_map, args.triplet_num_pos, args.triplet_num_neg, name2gid)
             triplet_batch_size = max(1, args.mini_batch_s // (args.triplet_num_pos * args.triplet_num_neg))
@@ -388,6 +407,24 @@ def main():
     do_mad = getattr(args, 'compute_mad', False)
     use_minibatch = getattr(args, 'use_minibatch_gnn', False)
     neighbor_sample_size = getattr(args, 'neighbor_sample_size', 0)
+
+    # --- Dynamic isolation setup (requires --include_cell_drug + --isolation_ratio > 0) ---
+    use_dynamic_isolation = (getattr(args, 'include_cell_drug', False)
+                             and getattr(args, 'isolation_ratio', 0.0) > 0)
+    training_cell_lids = []
+    if use_dynamic_isolation:
+        # Collect unique cell local IDs that appear in the LP training set
+        cell_type_id = dataset.node_name2type.get('cell', -1)
+        seen = set()
+        for src_gid, tgt_gid, _ in dataset.links.get('train_lp', []):
+            for gid in (src_gid, tgt_gid):
+                info = dataset.nodes['type_map'].get(gid)
+                if info is not None and info[0] == cell_type_id:
+                    seen.add(info[1])
+        training_cell_lids = sorted(seen)
+        n_per_epoch = max(1, int(len(training_cell_lids) * args.isolation_ratio))
+        print(f"  > Dynamic isolation: {len(training_cell_lids)} training cells, "
+              f"ratio={args.isolation_ratio} -> ~{n_per_epoch} isolated/epoch")
 
     print(f"\n--- Starting Model Training for {args.epochs} Epochs ---")
     print(f"L1: {args.l1_lambda > 0} | CellSim: {args.use_triplet_loss} | Node Gate: {getattr(args, 'use_node_gate', False)}")
@@ -463,6 +500,15 @@ def main():
                             triplet_iter = iter(train_loader_triplet)
                             triplet_batch_data = next(triplet_iter)
 
+                    # --- Create dynamic isolation masks for this batch ---
+                    isolation_masks = None
+                    isolated_cell_set = None
+                    if use_dynamic_isolation:
+                        n_isolate = max(1, int(len(training_cell_lids) * args.isolation_ratio))
+                        isolated = random.sample(training_cell_lids, n_isolate)
+                        isolated_cell_set = set(isolated)
+                        isolation_masks = model.create_isolation_masks(isolated)
+
                     # --- Compute embeddings: mini-batch or full-graph ---
                     subgraph_info = None
                     if use_minibatch:
@@ -480,14 +526,15 @@ def main():
                         # Move seeds to device
                         all_seeds = {nt: lids.to(device) for nt, lids in all_seeds.items()}
 
-                        # Expand to k-hop and compute subgraph embeddings
+                        # Expand to k-hop and compute subgraph embeddings (respecting isolation)
                         subgraph_info = model.expand_to_k_hop(
-                            all_seeds, k=args.n_layers, neighbor_sample_size=neighbor_sample_size
+                            all_seeds, k=args.n_layers, neighbor_sample_size=neighbor_sample_size,
+                            masks_override=isolation_masks,
                         )
                         embedding_tables = model.compute_batch_embeddings(subgraph_info)
                     else:
-                        # Full-graph forward: compute all embeddings (with gradients)
-                        embedding_tables = model.compute_all_embeddings()
+                        # Full-graph forward: compute all embeddings (with gradients, isolation-aware)
+                        embedding_tables = model.compute_all_embeddings(masks_override=isolation_masks)
 
                     # --- 1. Link Prediction Loss (dual-path) ---
                     loss_lp_gnn = model.link_prediction_loss(
@@ -495,6 +542,7 @@ def main():
                         isolation_ratio=args.isolation_ratio,
                         embedding_tables=embedding_tables,
                         subgraph_info=subgraph_info,
+                        isolated_cell_set=isolated_cell_set,
                     )
 
                     if args.proj_loss_weight > 0:
@@ -596,8 +644,9 @@ def main():
                     lm_info = loss_manager.epoch_summary()
                     parts = []
                     for k in ["lp", "triplet"]:
-                        if f"ema_{k}" in lm_info and lm_info[f"ema_{k}"] > 0:
-                            parts.append(f"{k}: ema={lm_info[f'ema_{k}']:.4f} w={lm_info[f'weight_{k}']:.3f} stale={lm_info[f'stale_{k}']}")
+                        ema_val = lm_info.get(f"ema_{k}")
+                        if ema_val is not None and ema_val > 0:
+                            parts.append(f"{k}: ema={ema_val:.4f} w={lm_info[f'weight_{k}']:.3f} stale={lm_info[f'stale_{k}']}")
                     print(f"  LossManager -> {' | '.join(parts)}")
 
                 # --- Dual Validation ---
@@ -613,7 +662,8 @@ def main():
                     if valid_loader_ind:
                         ind_metrics, _ = evaluate_model(
                             model, valid_loader_ind, generator, device, dataset,
-                            embedding_tables=eval_tables, regression=is_regression
+                            embedding_tables=eval_tables, regression=is_regression,
+                            use_inductive_head=True,
                         )
                         if is_regression:
                             val_ind_auc = ind_metrics['Spearman']

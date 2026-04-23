@@ -12,7 +12,7 @@ from dataloaders.data_generator import DataGenerator
 
 
 def evaluate_model(model, data_loader, generator: DataGenerator, device, dataset: PRELUDEDataset,
-                   embedding_tables=None, regression=False):
+                   embedding_tables=None, regression=False, use_inductive_head=False):
     """
     Evaluates the model on a given dataloader (validation or test).
     Classification mode: ROC-AUC, F1-Score, MRR.
@@ -61,7 +61,8 @@ def evaluate_model(model, data_loader, generator: DataGenerator, device, dataset
 
             preds = model.link_prediction_forward(
                 drug_lids, cell_lids, generator,
-                embedding_tables=embedding_tables
+                embedding_tables=embedding_tables,
+                use_inductive_head=use_inductive_head,
             )
 
             all_pred_probs.extend(preds.cpu().numpy())
